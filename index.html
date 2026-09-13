@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="theme-color" content="#0a0a0a">
+<title>MiniCodi</title>
+<link rel="stylesheet" href="styles.css">
+<style>
+  .changes-bar {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 12px; border-radius: var(--r-md);
+    background: rgba(245,158,11,0.1); border: 1px solid rgba(245,158,11,0.3);
+    margin-bottom: 12px; font-size: 13px; color: var(--warning);
+  }
+  .changes-bar span { flex: 1; font-weight: 500; }
+  .editor-wrap {
+    margin-top: 14px; border: 1px solid var(--border);
+    border-radius: var(--r-lg); overflow: hidden;
+  }
+  .editor-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 8px 12px; background: var(--surface-raised);
+    border-bottom: 1px solid var(--border); gap: 8px;
+  }
+  .editor-textarea {
+    width: 100%; min-height: 280px; padding: 12px;
+    background: var(--bg); color: var(--text);
+    font-family: var(--mono); font-size: 12px; line-height: 1.6;
+    border: none; outline: none; resize: vertical; tab-size: 2;
+  }
+  .file-item.active { background: var(--accent-dim); color: var(--accent); }
+  .diff-view {
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: var(--r-sm); padding: 10px 12px;
+    font-family: var(--mono); font-size: 11px; line-height: 1.6;
+    overflow-x: auto; white-space: pre; max-height: 260px;
+    overflow-y: auto; color: var(--text-secondary);
+  }
+  #panel-files { padding: 16px; }
+
+  /* ── Apply-to-file button (injected after AI code blocks) ── */
+  .apply-btn-wrap { margin: -6px 0 10px; }
+  .apply-btn {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 5px 12px; border-radius: var(--r-sm);
+    background: rgba(34,197,94,0.12); border: 1px solid rgba(34,197,94,0.35);
+    color: var(--positive); font-size: 12px; font-weight: 500;
+    cursor: pointer; transition: 0.15s; font-family: inherit;
+  }
+  .apply-btn:hover { background: rgba(34,197,94,0.22); }
+  .apply-btn code { font-family: var(--mono); font-size: 11px; opacity: 0.85; }
+  .apply-btn.applied {
+    background: rgba(34,197,94,0.06); color: var(--text-tertiary);
+    border-color: var(--border); cursor: default; pointer-events: none;
+  }
+
+  /* ── Context indicator shown in chat top bar ── */
+  .ctx-indicator {
+    font-size: 11px; color: var(--text-tertiary);
+    padding: 3px 0 6px; line-height: 1.4;
+  }
+  .ctx-indicator strong { color: var(--text-secondary); }
+</style>
+</head>
+<body>
+<div id="app">
+
+  <header class="app-header">
+    <h1>MiniCodi</h1>
+    <div class="header-right">
+      <button class="icon-btn" id="btnNewProject" title="New project">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 5v14M5 12h14"/></svg>
+      </button>
+      <button class="icon-btn" id="btnSettingsShortcut" title="Settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/>
+        </svg>
+      </button>
+    </div>
+  </header>
+
+  <div class="panels">
+
+    <!-- Projects -->
+    <div class="panel active" id="panel-projects">
+      <div class="section-title">Projects</div>
+      <div id="projectsList"></div>
+      <div id="projectsEmpty" class="empty-state hidden">
+        <div class="empty-icon">📁</div>
+        <div class="empty-title">No projects yet</div>
+        <div class="empty-desc">Tap + to create a project, then pull a GitHub repo into it.</div>
+        <button class="btn btn-primary mt-4" onclick="openSheet('sheetProject')">Create Project</button>
+      </div>
+    </div>
+
+    <!-- Chat -->
+    <div class="panel" id="panel-chat">
+      <div class="chat-top">
+        <div class="chat-model-row">
+          <div class="model-select-wrap">
+            <select id="modelSelect"><option value="">Select model…</option></select>
+          </div>
+        </div>
+        <div id="ctxIndicator" class="ctx-indicator"></div>
+        <div class="chat-role-tabs" id="roleTabs">
+          <button class="role-tab active" data-role="">General</button>
+          <button class="role-tab" data-role="frontend">Frontend</button>
+          <button class="role-tab" data-role="backend">Backend</button>
+          <button class="role-tab" data-role="reviewer">Reviewer</button>
+          <button class="role-tab" data-role="production">Prod Ready</button>
+        </div>
+      </div>
+      <div class="chat-messages" id="chatMessages"></div>
+      <div class="chat-bottom">
+        <div class="chat-tools">
+          <button class="tool-btn" data-tool="read">📄 Read</button>
+          <button class="tool-btn" data-tool="write">✏️ Write</button>
+          <button class="tool-btn" data-tool="run">⚡ Run</button>
+          <button class="tool-btn" data-tool="review">🔍 Review</button>
+        </div>
+        <div class="chat-input-row">
+          <textarea class="chat-input" id="chatInput" placeholder="Ask the AI…" rows="1"></textarea>
+          <button class="send-btn" id="sendBtn">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M22 2L11 13M22 2L15 22 11 13 2 9l20-7z"/></svg>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Files — content rendered dynamically by app.js -->
+    <div class="panel" id="panel-files">
+      <div class="empty-state">
+        <div class="empty-icon">🗂</div>
+        <div class="empty-title">Loading…</div>
+      </div>
+    </div>
+
+    <!-- Git -->
+    <div class="panel" id="panel-git">
+      <div class="section-title">Git Integration</div>
+
+      <div id="gitNotConnected">
+        <div class="empty-state" style="padding:24px 0;">
+          <div class="empty-icon">🔌</div>
+          <div class="empty-title">Connect GitHub</div>
+          <div class="empty-desc mb-2">Link your account to pull repos and push changes.</div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">GitHub Token</label>
+          <input type="password" class="form-input" id="githubTokenInput" placeholder="ghp_xxxxxxxxxxxx">
+          <div class="form-hint">Create at github.com/settings/tokens — scope: <strong>repo</strong></div>
+        </div>
+        <button class="btn btn-primary btn-block mt-3" id="btnConnectGit">Connect to GitHub</button>
+        <div class="divider mt-4"></div>
+        <div class="text-secondary text-sm mb-2">Or load a local ZIP project:</div>
+        <label class="btn btn-secondary btn-block" style="cursor:pointer;">
+          📦 Upload ZIP Project
+          <input type="file" id="zipUpload" accept=".zip" class="hidden">
+        </label>
+      </div>
+
+      <div id="gitConnected" class="hidden">
+        <div class="card flex items-center justify-between mb-3" style="gap:10px;">
+          <div>
+            <div class="card-title" id="gitUserName">GitHub User</div>
+            <div class="card-sub text-accent" id="gitUserLogin">@login</div>
+          </div>
+          <button class="btn-sm danger" id="btnDisconnectGit">Disconnect</button>
+        </div>
+
+        <div id="repoList"></div>
+
+        <div id="repoDetail" class="hidden">
+          <div class="divider"></div>
+          <div class="text-sm text-secondary mb-2" id="repoDetailName"></div>
+          <div id="fileTree"></div>
+          <div class="git-actions">
+            <button class="btn btn-secondary" id="btnPull">⬇ Pull</button>
+            <button class="btn btn-secondary" id="btnCommit">Commit…</button>
+            <button class="btn btn-secondary" id="btnPush">⬆ Push…</button>
+          </div>
+          <div class="mt-4">
+            <div class="form-label">Recent Commits</div>
+            <div id="commitList"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Settings -->
+    <div class="panel" id="panel-settings">
+      <div class="section-title">Settings</div>
+      <div class="form-group">
+        <label class="form-label">Groq API Key</label>
+        <input type="password" class="form-input" id="groqKey" placeholder="gsk_xxxxxxxxxxxx">
+      </div>
+      <div class="form-group">
+        <label class="form-label">OpenRouter API Key</label>
+        <input type="password" class="form-input" id="openrouterKey" placeholder="sk-or-v1-xxxxxxxx">
+      </div>
+      <div class="form-group">
+        <label class="form-label">GitHub Token</label>
+        <input type="password" class="form-input" id="githubTokenSettings" placeholder="ghp_xxxxxxxxxxxx">
+        <div class="form-hint">Scope: <code>repo</code> — fine-grained tokens recommended</div>
+      </div>
+      <div class="divider"></div>
+      <div class="toggle-row">
+        <span class="toggle-label">Stream responses</span>
+        <button class="toggle-switch on" id="togStream" onclick="app.toggle('stream')"></button>
+      </div>
+      <div class="toggle-row">
+        <span class="toggle-label">Auto-save chats</span>
+        <button class="toggle-switch on" id="togAutosave" onclick="app.toggle('autosave')"></button>
+      </div>
+      <div class="toggle-row">
+        <span class="toggle-label">Confirm commands</span>
+        <button class="toggle-switch" id="togConfirm" onclick="app.toggle('confirmCommands')"></button>
+      </div>
+      <div class="divider"></div>
+      <div class="form-group">
+        <label class="form-label">Max tokens per request</label>
+        <input type="number" class="form-input" id="maxTokens" value="2048" min="256" max="8192" step="256">
+        <div class="form-hint">2048 is good for most tasks. Lower = faster + cheaper.</div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">System prompt (optional)</label>
+        <textarea class="form-textarea" id="systemPrompt" placeholder="You are a senior developer…"></textarea>
+      </div>
+      <button class="btn btn-primary btn-block mt-3" id="btnSaveSettings">Save Settings</button>
+      <div class="divider"></div>
+      <div class="flex gap-2 mt-2">
+        <button class="btn btn-secondary" style="flex:1" id="btnExport">Export data</button>
+        <button class="btn btn-secondary" style="flex:1" id="btnImport">Import data</button>
+        <input type="file" id="importFile" class="hidden" accept=".json">
+      </div>
+      <button class="btn btn-danger btn-block mt-2" id="btnClearAll">Clear all data</button>
+    </div>
+
+  </div><!-- /panels -->
+
+  <!-- Bottom Nav — 5 tabs -->
+  <nav class="bottom-nav">
+    <button class="nav-item active" data-panel="projects">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+        <path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/>
+      </svg>
+      <span class="nav-label">Projects</span>
+    </button>
+    <button class="nav-item" data-panel="chat">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+        <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/>
+      </svg>
+      <span class="nav-label">Chat</span>
+    </button>
+    <button class="nav-item" data-panel="files">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+        <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/>
+        <polyline points="14 2 14 8 20 8"/>
+        <line x1="16" y1="13" x2="8" y2="13"/>
+        <line x1="16" y1="17" x2="8" y2="17"/>
+      </svg>
+      <span class="nav-label">Files</span>
+    </button>
+    <button class="nav-item" data-panel="git">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+        <circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/>
+        <path d="M6 9v3m0 3v3M9 6h3a6 6 0 016 6v0"/>
+      </svg>
+      <span class="nav-label">Git</span>
+    </button>
+    <button class="nav-item" data-panel="settings">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+        <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/>
+      </svg>
+      <span class="nav-label">Settings</span>
+    </button>
+  </nav>
+</div>
+
+<div class="toast-wrap" id="toasts"></div>
+
+<!-- Sheet: New Project -->
+<div class="overlay" id="sheetProject">
+  <div class="sheet">
+    <div class="sheet-header">
+      <div class="sheet-title" id="sheetProjectTitle">New Project</div>
+      <button class="sheet-close" onclick="closeSheet('sheetProject')">&times;</button>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Name</label>
+      <input type="text" class="form-input" id="projName" placeholder="my-app">
+    </div>
+    <div class="form-group">
+      <label class="form-label">Description</label>
+      <input type="text" class="form-input" id="projDesc" placeholder="A brief description…">
+    </div>
+    <div class="form-group">
+      <label class="form-label">Tech stack</label>
+      <select class="form-select" id="projStack">
+        <option value="vanilla">Vanilla JS / HTML</option>
+        <option value="react">React</option>
+        <option value="vue">Vue</option>
+        <option value="node">Node.js</option>
+        <option value="python">Python</option>
+        <option value="other">Other</option>
+      </select>
+    </div>
+    <button class="btn btn-primary btn-block" id="btnSaveProject">Create Project</button>
+  </div>
+</div>
+
+<!-- Sheet: Commit & Push -->
+<div class="overlay" id="sheetCommit">
+  <div class="sheet">
+    <div class="sheet-header">
+      <div class="sheet-title">Push Changes</div>
+      <button class="sheet-close" onclick="closeSheet('sheetCommit')">&times;</button>
+    </div>
+    <div class="commit-area">
+      <div class="form-group">
+        <label class="form-label">Commit message</label>
+        <input type="text" class="form-input" id="commitMsg" placeholder="feat: improve error handling">
+      </div>
+      <p class="form-hint" style="margin-bottom:12px;">
+        Commits all local changes atomically. Blocked if remote has new commits since your last pull.
+      </p>
+      <button class="btn btn-primary btn-block" id="btnDoCommit">Commit &amp; Push</button>
+    </div>
+  </div>
+</div>
+
+<!-- Sheet: Review Changes (diff) -->
+<div class="overlay" id="sheetChanges">
+  <div class="sheet">
+    <div class="sheet-header">
+      <div class="sheet-title">Local Changes</div>
+      <button class="sheet-close" onclick="closeSheet('sheetChanges')">&times;</button>
+    </div>
+    <div id="changesBody"></div>
+    <div style="margin-top:16px;display:flex;gap:8px;">
+      <button class="btn btn-primary" style="flex:1"
+              onclick="closeSheet('sheetChanges');openSheet('sheetCommit')">Push…</button>
+      <button class="btn btn-secondary" style="flex:1"
+              onclick="closeSheet('sheetChanges')">Close</button>
+    </div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
