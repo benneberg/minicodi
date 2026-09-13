@@ -346,13 +346,10 @@
     </div>
   </div>
 </div>
+<script src="https://cdn.jsdelivr.net/npm/insikt.js/dist/insikt.umd.js"></script>
+<!-- Ensure your main logic runs after or uses defer -->
+<script src="app.js" defer></script>
 
 <script src="./app.js"></script>
-  <script>window.onerror = function(msg, url, line, col, error) {
-  const errDiv = document.createElement('div');
-  errDiv.style.cssText = 'background:#ff4444; color:#fff; padding:1rem; position:fixed; top:0; left:0; z-index:9999; font-family:monospace;';
-  errDiv.innerText = `${msg} at ${line}:${col}`;
-  document.body.prepend(errDiv);
-};</script>
 </body>
 </html>
