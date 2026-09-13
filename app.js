@@ -27,20 +27,21 @@ const TEXT_EXTS = /\.(js|ts|jsx|tsx|vue|svelte|html|css|scss|sass|less|json|md|y
 const SKIP_EXTS = /\.(png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|eot|pdf|zip|gz|tar|mp4|mp3|webp|lock|map|min\.js|min\.css)$/i;
 
 // ════════════════════════════════════════════════
-// IndexedDB  (version 2 — migrates existing data)
+// IndexedDB  (bumped to version 2 — migrates existing data)
 // ════════════════════════════════════════════════
 class DB {
   constructor() { this._db = null; }
 
   async init() {
     return new Promise((res, rej) => {
+      // Version 2: adds githubSha/baseContent/status to files, adds gitSnapshots
       const req = indexedDB.open('MiniCodi', 2);
       req.onerror   = () => rej(req.error);
       req.onsuccess = () => { this._db = req.result; res(); };
 
       req.onupgradeneeded = e => {
         const db  = e.target.result;
-        const old = e.oldVersion;
+        const old = e.oldVersion; // 0 = fresh, 1 = DevAI_v2 users
 
         if (!db.objectStoreNames.contains('projects')) {
           db.createObjectStore('projects', { keyPath: 'id', autoIncrement: true });
@@ -57,12 +58,14 @@ class DB {
           fs.createIndex('projectId', 'projectId');
           fs.createIndex('projectPath', ['projectId', 'path'], { unique: false });
         }
+        // New in v2
         if (!db.objectStoreNames.contains('gitSnapshots')) {
           const gs = db.createObjectStore('gitSnapshots', { keyPath: 'id', autoIncrement: true });
           gs.createIndex('projectId', 'projectId');
         }
+        // Migrate existing files: add missing fields
         if (old === 1 && db.objectStoreNames.contains('files')) {
-          const tx    = e.target.transaction;
+          const tx   = e.target.transaction;
           const store = tx.objectStore('files');
           store.openCursor().onsuccess = function(ev) {
             const cursor = ev.target.result;
@@ -108,7 +111,7 @@ class DB {
 }
 
 // ════════════════════════════════════════════════
-// Workspace — local file CRUD + status tracking
+// Workspace  — local file CRUD + status tracking
 // ════════════════════════════════════════════════
 class Workspace {
   constructor(db) { this.db = db; }
@@ -127,7 +130,7 @@ class Workspace {
     if (existing) {
       const newStatus = existing.status === 'clean'
         ? (content !== existing.baseContent ? 'modified' : 'clean')
-        : existing.status;
+        : existing.status; // keep 'new' if was new
       const updated = {
         ...existing,
         content,
@@ -151,6 +154,7 @@ class Workspace {
     const f = await this.readFile(projectId, path);
     if (!f) return;
     if (f.githubSha) {
+      // Was on GitHub — mark deleted so push can remove it
       await this.db.put('files', { ...f, status: 'deleted', updatedAt: Date.now() });
     } else {
       await this.db.del('files', f.id);
@@ -162,6 +166,7 @@ class Workspace {
     return all.filter(f => f.status !== 'clean');
   }
 
+  // Mark all files clean after a successful push
   async markAllClean(projectId) {
     const all = await this.listFiles(projectId);
     for (const f of all) {
@@ -180,7 +185,7 @@ class Workspace {
 }
 
 // ════════════════════════════════════════════════
-// GitHub Service Client
+// GitHub client — REST + Git Data API
 // ════════════════════════════════════════════════
 class GitHub {
   constructor(token) {
@@ -204,6 +209,7 @@ class GitHub {
     return r.json();
   }
 
+  // ── Browsing ──────────────────────────────────
   getUser()               { return this.req('/user'); }
   getRepos()              { return this.req('/user/repos?sort=updated&per_page=50&affiliation=owner,collaborator'); }
   getContents(o, r, p='') { return this.req(`/repos/${o}/${r}/contents/${p}`); }
@@ -212,24 +218,31 @@ class GitHub {
   getRepo(o, r)           { return this.req(`/repos/${o}/${r}`); }
 
   async getFileMeta(o, r, p, b = 'main') {
+    // Returns { content, sha } — sha needed for single-file updates
     const d = await this.req(`/repos/${o}/${r}/contents/${p}?ref=${b}`);
     const content = d.encoding === 'base64' ? atob(d.content.replace(/\s/g, '')) : d.content;
     return { content, sha: d.sha };
   }
 
+  // ── Git Data API ──────────────────────────────
+
+  // Get the SHA of branch HEAD
   async getRef(o, r, branch) {
     const d = await this.req(`/repos/${o}/${r}/git/ref/heads/${branch}`);
-    return d.object.sha;
+    return d.object.sha; // commit SHA
   }
 
+  // Get commit → returns { tree: { sha } }
   async getCommit(o, r, sha) {
     return this.req(`/repos/${o}/${r}/git/commits/${sha}`);
   }
 
+  // Get full recursive tree
   async getTree(o, r, treeSha) {
     return this.req(`/repos/${o}/${r}/git/trees/${treeSha}?recursive=1`);
   }
 
+  // Create a blob from string content
   async createBlob(o, r, content) {
     return this.req(`/repos/${o}/${r}/git/blobs`, {
       method:  'POST',
@@ -238,6 +251,8 @@ class GitHub {
     });
   }
 
+  // Create a new tree on top of baseTreeSha with file changes
+  // items: [{ path, mode:'100644', type:'blob', sha }]  or sha=null to delete
   async createTree(o, r, baseTreeSha, items) {
     return this.req(`/repos/${o}/${r}/git/trees`, {
       method:  'POST',
@@ -246,6 +261,7 @@ class GitHub {
     });
   }
 
+  // Create a commit
   async createCommit(o, r, message, treeSha, parentSha) {
     return this.req(`/repos/${o}/${r}/git/commits`, {
       method:  'POST',
@@ -254,6 +270,7 @@ class GitHub {
     });
   }
 
+  // Move branch HEAD to new commit SHA
   async updateRef(o, r, branch, sha) {
     return this.req(`/repos/${o}/${r}/git/refs/heads/${branch}`, {
       method:  'PATCH',
@@ -264,7 +281,7 @@ class GitHub {
 }
 
 // ════════════════════════════════════════════════
-// Git Workspace Integration
+// GitWorkspace — high-level pull / push
 // ════════════════════════════════════════════════
 class GitWorkspace {
   constructor(db, workspace, gh) {
@@ -273,21 +290,27 @@ class GitWorkspace {
     this.gh        = gh;
   }
 
+  // Pull all files from GitHub into local workspace
   async pull(projectId, owner, repo, branch, onProgress) {
+    // 1. Get HEAD commit SHA
     const commitSha = await this.gh.getRef(owner, repo, branch);
     onProgress?.(`Resolving HEAD: ${commitSha.slice(0, 7)}…`);
 
-    const commit  = await this.gh.getCommit(owner, repo, commitSha);
+    // 2. Get commit → tree SHA
+    const commit = await this.gh.getCommit(owner, repo, commitSha);
     const treeSha = commit.tree.sha;
 
+    // 3. Get recursive tree (all files)
     const { tree, truncated } = await this.gh.getTree(owner, repo, treeSha);
     if (truncated) onProgress?.('⚠ Tree truncated — repo may be very large');
 
-    const SKIP_EXT  = /\.(png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|eot|pdf|zip|gz|tar|mp4|mp3|webp|lock)$/i;
+    // Only text-like files, skip binaries by extension
+    const SKIP_EXT = /\.(png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|eot|pdf|zip|gz|tar|mp4|mp3|webp|lock)$/i;
     const textFiles = tree.filter(f => f.type === 'blob' && !SKIP_EXT.test(f.path));
 
     onProgress?.(`Downloading ${textFiles.length} files…`);
 
+    // Download in batches of 5 to avoid rate limits
     const BATCH = 5;
     let done = 0;
     for (let i = 0; i < textFiles.length; i += BATCH) {
@@ -308,6 +331,7 @@ class GitWorkspace {
       }));
     }
 
+    // 4. Save snapshot
     await this.db.put('gitSnapshots', {
       projectId, owner, repo, branch,
       commitSha, treeSha,
@@ -317,15 +341,19 @@ class GitWorkspace {
     return { commitSha, fileCount: done };
   }
 
+  // Get latest local snapshot for project
   async getSnapshot(projectId) {
     const snaps = await this.db.byIndex('gitSnapshots', 'projectId', projectId);
     return snaps.sort((a, b) => b.createdAt - a.createdAt)[0] || null;
   }
 
+  // Atomic multi-file push via Git Data API
   async push(projectId, owner, repo, branch, message, onProgress) {
+    // 1. Get current remote HEAD
     const remoteHeadSha = await this.gh.getRef(owner, repo, branch);
     onProgress?.('Checking remote…');
 
+    // 2. Conflict check: compare with our snapshot
     const snap = await this.getSnapshot(projectId);
     if (snap && snap.commitSha !== remoteHeadSha) {
       throw new Error(
@@ -333,13 +361,16 @@ class GitWorkspace {
       );
     }
 
+    // 3. Collect changed files
     const changes = await this.workspace.getChanges(projectId);
     if (!changes.length) throw new Error('No local changes to push.');
     onProgress?.(`${changes.length} changed files — creating blobs…`);
 
+    // 4. Create a blob for each changed (non-deleted) file
     const treeItems = [];
     for (const f of changes) {
       if (f.status === 'deleted') {
+        // Deletion: include path with sha null
         treeItems.push({ path: f.path, mode: '100644', type: 'blob', sha: null });
       } else {
         const blob = await this.gh.createBlob(owner, repo, f.content);
@@ -348,16 +379,22 @@ class GitWorkspace {
     }
     onProgress?.('Creating tree…');
 
-    const headCommit  = await this.gh.getCommit(owner, repo, remoteHeadSha);
+    // 5. Get base tree SHA from remote HEAD commit
+    const headCommit = await this.gh.getCommit(owner, repo, remoteHeadSha);
     const baseTreeSha = headCommit.tree.sha;
 
-    const newTree   = await this.gh.createTree(owner, repo, baseTreeSha, treeItems);
+    // 6. Create new tree
+    const newTree = await this.gh.createTree(owner, repo, baseTreeSha, treeItems);
     onProgress?.('Creating commit…');
 
+    // 7. Create commit
     const newCommit = await this.gh.createCommit(owner, repo, message, newTree.sha, remoteHeadSha);
+
+    // 8. Update branch ref
     await this.gh.updateRef(owner, repo, branch, newCommit.sha);
     onProgress?.('Updating branch…');
 
+    // 9. Mark all local files clean + update snapshot
     await this.workspace.markAllClean(projectId);
     await this.db.put('gitSnapshots', {
       ...(snap || {}),
@@ -372,7 +409,7 @@ class GitWorkspace {
 }
 
 // ════════════════════════════════════════════════
-// Context Builder
+// ContextBuilder — whole-project awareness
 // ════════════════════════════════════════════════
 class ContextBuilder {
   constructor(workspace) { this.workspace = workspace; }
@@ -383,23 +420,32 @@ class ContextBuilder {
     return content.slice(0, half) + '\n// …[truncated]…\n' + content.slice(-half);
   }
 
+  // Score a file's relevance to the user's message (0–100)
   _score(file, userText, openFilePath, changedPaths) {
     let score = 0;
     const p   = file.path.toLowerCase();
     const q   = (userText || '').toLowerCase();
 
+    // Currently open file = highest priority
     if (file.path === openFilePath) return 100;
+
+    // Changed files are always relevant
     if (changedPaths.has(file.path)) score += 60;
+
+    // Entry points and config files — always useful for understanding project
     if (ENTRY_POINTS.some(e => file.path.endsWith(e) || file.path === e)) score += 40;
 
+    // Filename or directory mentioned in user's message
     const name = p.split('/').pop().replace(/\.\w+$/, '');
     if (q.includes(name) && name.length > 2) score += 50;
 
+    // Path segments mentioned in query (e.g. "components", "auth", "api")
     const segments = p.split('/').slice(0, -1);
     for (const seg of segments) {
       if (seg.length > 2 && q.includes(seg)) score += 20;
     }
 
+    // Feature keywords — if user mentions a feature, match related file names
     const FEATURE_PATTERNS = [
       ['auth','login','session','token','jwt','password','user'],
       ['api','endpoint','route','controller','handler','request'],
@@ -417,32 +463,38 @@ class ContextBuilder {
       if (matchesQuery && matchesFile) score += 35;
     }
 
+    // Prefer smaller files (less token cost for same information)
     const len = (file.content || '').length;
     if (len < 500)  score += 10;
     if (len > 8000) score -= 15;
 
+    // Penalise test files unless user is asking about tests
     if (p.includes('.test.') || p.includes('.spec.')) {
       if (!q.includes('test') && !q.includes('spec')) score -= 20;
     }
 
+    // Penalise lockfiles, generated, dist
     if (p.includes('dist/') || p.includes('.min.') || p.includes('node_modules/')) score = -1;
 
     return Math.max(0, score);
   }
 
+  // Build the full context block for a message
   async build(projectId, openFilePath, repoInfo, userText) {
     if (!projectId) return '';
 
-    const allFiles     = await this.workspace.listFiles(projectId);
-    const changes      = await this.workspace.getChanges(projectId);
+    const allFiles    = await this.workspace.listFiles(projectId);
+    const changes     = await this.workspace.getChanges(projectId);
     const changedPaths = new Set(changes.map(f => f.path));
 
     const parts = [];
 
+    // 1. Repo / project header
     if (repoInfo) {
       parts.push(`Repository: ${repoInfo.owner}/${repoInfo.repo} (branch: ${repoInfo.branch})`);
     }
 
+    // 2. Full file tree — always send this so AI knows what exists
     const textFiles = allFiles.filter(f => TEXT_EXTS.test(f.path) && !SKIP_EXTS.test(f.path));
     if (textFiles.length) {
       const tree = textFiles.map(f => {
@@ -452,11 +504,13 @@ class ContextBuilder {
       parts.push(`\nProject file tree (${textFiles.length} files):\n${tree}`);
     }
 
+    // 3. Score + select files to include as full content
     const scored = textFiles
       .map(f => ({ f, score: this._score(f, userText, openFilePath, changedPaths) }))
       .filter(({ score }) => score > 0)
       .sort((a, b) => b.score - a.score);
 
+    // Fill budget greedily from highest-scored files
     let budget   = CTX_TOKEN_BUDGET;
     const chosen = [];
     for (const { f } of scored) {
@@ -478,6 +532,7 @@ class ContextBuilder {
       }
     }
 
+    // 4. Changed files not already shown — list with diff summary
     const unshownChanges = changes.filter(c => !chosen.find(ch => ch.path === c.path));
     if (unshownChanges.length) {
       parts.push(`\nAlso locally modified (content omitted to save tokens):`);
@@ -491,7 +546,7 @@ class ContextBuilder {
 }
 
 // ════════════════════════════════════════════════
-// LLM API Clients
+// LLM clients
 // ════════════════════════════════════════════════
 class GroqClient {
   constructor(key) { this.key = key; this.base = 'https://api.groq.com/openai/v1'; }
@@ -501,8 +556,8 @@ class GroqClient {
       headers: { 'Authorization': `Bearer ${this.key}` }
     });
     if (!r.ok) throw new Error(`Groq models: ${r.status}`);
-    const d  = await r.json();
-    const ok = ['llama', 'mixtral', 'gemma', 'qwen', 'deepseek'];
+    const d   = await r.json();
+    const ok  = ['llama', 'mixtral', 'gemma', 'qwen', 'deepseek'];
     return d.data
       .filter(m => ok.some(k => m.id.toLowerCase().includes(k)))
       .map(m => ({ id: m.id, label: `${m.id} (Groq)`, provider: 'groq' }));
@@ -580,7 +635,7 @@ async function* parseSSE(body) {
 }
 
 // ════════════════════════════════════════════════
-// Roles
+// Expert role prompts (compact)
 // ════════════════════════════════════════════════
 const ROLES = {
   '':         'You are MiniCodi, a concise AI coding assistant. Give working code with brief explanations. Use markdown code blocks with filenames as comments (e.g. `// filename.js`). Be direct.',
@@ -592,11 +647,14 @@ const ROLES = {
 };
 
 // ════════════════════════════════════════════════
-// Sheet Helpers & Markdown Renderer
+// Sheet / overlay helpers
 // ════════════════════════════════════════════════
 function openSheet(id)  { document.getElementById(id).classList.add('open'); }
 function closeSheet(id) { document.getElementById(id).classList.remove('open'); }
 
+// ════════════════════════════════════════════════
+// Markdown renderer
+// ════════════════════════════════════════════════
 function esc(t) {
   const d = document.createElement('div');
   d.textContent = String(t ?? '');
@@ -623,6 +681,7 @@ function renderMd(raw) {
   return s;
 }
 
+// Simple line-level diff (base vs current)
 function simpleDiff(base, current) {
   if (!base) return current.split('\n').map(l => `+ ${l}`).join('\n');
   const bLines = (base    || '').split('\n');
@@ -640,31 +699,34 @@ function simpleDiff(base, current) {
 }
 
 // ════════════════════════════════════════════════
-// Application Orchestrator
+// App
 // ════════════════════════════════════════════════
 class App {
   constructor() {
     this.db             = new DB();
-    this.workspace      = null;
-    this.ctx            = null;
+    this.workspace      = null;  // set after db.init
+    this.ctx            = null;  // ContextBuilder
     this.cfg            = {};
     this.projects       = [];
     this.currentProjId  = null;
-    this.currentProj    = null;
+    this.currentProj    = null;  // full project object
     this.messages       = [];
     this.models         = [];
     this.activeRole     = '';
     this.activeTools    = new Set();
     this.isGenerating   = false;
+    // GitHub
     this.gh             = null;
     this.ghWorkspace    = null;
     this.ghUser         = null;
     this.repos          = [];
-    this.currentRepo    = null;
-    this.openFilePath   = null;
-    this.fileBrowserDir = '';
+    this.currentRepo    = null;  // { owner, repo, branch }
+    // File browser / editor
+    this.openFilePath   = null;  // currently open file path
+    this.fileBrowserDir = '';    // current directory prefix
   }
 
+  // ── Init ──────────────────────────────────────
   async init() {
     await this.db.init();
     this.workspace = new Workspace(this.db);
@@ -689,6 +751,7 @@ class App {
     this._toast('MiniCodi ready', 'success');
   }
 
+  // ── Settings ──────────────────────────────────
   async _loadSettings() {
     const rows   = await this.db.getAll('settings');
     this.cfg     = rows.reduce((a, r) => ({ ...a, [r.key]: r.value }), {});
@@ -740,6 +803,7 @@ class App {
     this._toast('Settings saved', 'success');
   }
 
+  // ── Navigation ────────────────────────────────
   _setupNav() {
     document.querySelectorAll('.nav-item').forEach(btn => {
       btn.addEventListener('click', () => this._switchPanel(btn.dataset.panel));
@@ -758,6 +822,7 @@ class App {
     if (name === 'files') this._renderFileBrowser();
   }
 
+  // ── Models ────────────────────────────────────
   async _loadModels() {
     const sel  = document.getElementById('modelSelect');
     const prev = sel.value;
@@ -807,6 +872,7 @@ class App {
     if (!sel.value && sel.options.length > 1) sel.selectedIndex = 1;
   }
 
+  // ── Projects ──────────────────────────────────
   _setupProject() {
     document.getElementById('btnNewProject').addEventListener('click', () => {
       document.getElementById('sheetProjectTitle').textContent = 'New Project';
@@ -900,6 +966,7 @@ class App {
     this._updateCtxIndicator('');
   }
 
+  // ── File Browser ──────────────────────────────
   async _renderFileBrowser() {
     const panel = document.getElementById('panel-files');
     if (!panel) return;
@@ -918,14 +985,16 @@ class App {
     const files   = await this.workspace.listFiles(this.currentProjId);
     const changes = files.filter(f => f.status !== 'clean');
 
+    // Build directory tree
     const dir   = this.fileBrowserDir;
     const inDir = files.filter(f => f.path.startsWith(dir) && f.status !== 'deleted');
 
-    const subdirs  = new Set();
+    // Get unique subdirs in current dir
+    const subdirs = new Set();
     const dirFiles = [];
     for (const f of inDir) {
-      const rel = f.path.slice(dir.length);
-      const sep = rel.indexOf('/');
+      const rel  = f.path.slice(dir.length);
+      const sep  = rel.indexOf('/');
       if (sep > -1) subdirs.add(rel.slice(0, sep));
       else dirFiles.push(f);
     }
@@ -987,6 +1056,7 @@ class App {
       ${this.openFilePath ? this._renderEditorHTML() : ''}
     `;
 
+    // Re-attach editor events after render
     if (this.openFilePath) this._attachEditorEvents();
   }
 
@@ -1021,7 +1091,7 @@ class App {
   }
 
   async _attachEditorEvents() {
-    const f  = await this.workspace.readFile(this.currentProjId, this.openFilePath);
+    const f = await this.workspace.readFile(this.currentProjId, this.openFilePath);
     const ta = document.getElementById('editorTextarea');
     if (ta && f) ta.value = f.content;
 
@@ -1063,7 +1133,7 @@ class App {
   }
 
   async _newFile() {
-    const path = prompt('File path (e.g. services/api.js):');
+    const path = prompt('File path (e.g. src/utils.js):');
     if (!path) return;
     await this.workspace.writeFile(this.currentProjId, path, '');
     this.openFilePath = path;
@@ -1103,6 +1173,7 @@ class App {
     this._toast('File reverted', 'success');
   }
 
+  // ── Chat ──────────────────────────────────────
   _setupChat() {
     document.getElementById('roleTabs').addEventListener('click', e => {
       const tab = e.target.closest('.role-tab');
@@ -1126,7 +1197,7 @@ class App {
     });
     document.getElementById('chatInput').addEventListener('input', function () {
       this.style.height = 'auto';
-      this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+      this.style.height = Math.min(this.scrollHeight, 100) + 'px';
     });
   }
 
@@ -1137,81 +1208,30 @@ class App {
   }
 
   _renderMessages() {
-    const wrap = document.getElementById('chatMessages');
-    if (!wrap) return;
-
+    const el = document.getElementById('chatMessages');
     if (!this.messages.length) {
-      wrap.innerHTML = `
+      el.innerHTML = `
         <div class="empty-state">
-          <div class="empty-icon">💬</div>
-          <div class="empty-title">Start a conversation</div>
-          <div class="empty-desc">Ask for code, code reviews, architectural advice, or implementation steps.</div>
+          <div class="empty-icon">🤖</div>
+          <div class="empty-title">Start coding with AI</div>
+          <div class="empty-desc">Pull a repo or open a file, then ask the AI to review or improve it.</div>
         </div>`;
       return;
     }
+    el.innerHTML = this.messages.map(m => this._msgHTML(m)).join('');
+    el.scrollTop = el.scrollHeight;
+  }
 
-    wrap.innerHTML = this.messages.map(m => `
+  _msgHTML(m) {
+    const isUser = m.role === 'user';
+    return `
       <div class="message ${m.role}">
-        <div class="msg-avatar">${m.role === 'user' ? 'U' : 'AI'}</div>
+        <div class="msg-avatar">${isUser ? 'You' : 'AI'}</div>
         <div class="msg-body">
-          <div class="msg-name">${m.role === 'user' ? 'You' : 'MiniCodi'}</div>
+          <div class="msg-name">${isUser ? 'You' : 'Assistant'}</div>
           <div class="msg-bubble">${renderMd(m.content)}</div>
         </div>
-      </div>
-    `).join('');
-
-    this._injectApplyButtons();
-    wrap.scrollTop = wrap.scrollHeight;
-  }
-
-  _injectApplyButtons() {
-    const wrap = document.getElementById('chatMessages');
-    if (!wrap || !this.currentProjId) return;
-
-    wrap.querySelectorAll('.message.assistant .msg-bubble pre').forEach(pre => {
-      if (pre.nextElementSibling?.classList.contains('apply-btn-wrap')) return;
-
-      const code = pre.querySelector('code')?.textContent || '';
-      const match = code.match(/^(?:\/\/\s*|#\s*|<!--\s*)([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]+)/);
-      const filePath = match ? match[1] : null;
-
-      const btnWrap = document.createElement('div');
-      btnWrap.className = 'apply-btn-wrap';
-
-      if (filePath) {
-        btnWrap.innerHTML = `
-          <button class="apply-btn" onclick="app._applyCodeBlock(this, '${esc(filePath)}')">
-            <span>Apply to</span> <code>${esc(filePath)}</code>
-          </button>`;
-      } else {
-        btnWrap.innerHTML = `
-          <button class="apply-btn" onclick="app._applyCodeBlockPrompt(this)">
-            <span>Apply to file…</span>
-          </button>`;
-      }
-      pre.after(btnWrap);
-    });
-  }
-
-  async _applyCodeBlock(btn, path) {
-    const pre = btn.closest('.apply-btn-wrap')?.previousElementSibling;
-    const code = pre?.querySelector('code')?.textContent || '';
-    if (!code) return;
-
-    const cleanCode = code.replace(/^(?:\/\/\s*|#\s*|<!--\s*)[a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]+\s*(?:-->)?\n?/, '');
-
-    await this.workspace.writeFile(this.currentProjId, path, cleanCode);
-    await this.db.put('projects', { ...this.currentProj, updatedAt: Date.now() });
-
-    btn.classList.add('applied');
-    btn.innerHTML = `✓ Applied to <code>${esc(path)}</code>`;
-    this._toast(`Updated: ${path}`, 'success');
-  }
-
-  async _applyCodeBlockPrompt(btn) {
-    const path = prompt('File path to write this code to:');
-    if (!path) return;
-    await this._applyCodeBlock(btn, path);
+      </div>`;
   }
 
   async _send() {
@@ -1221,20 +1241,23 @@ class App {
     if (!text) return;
 
     if (!this.currentProjId) {
-      this._toast('Create or select a project first', 'warning');
+      this._toast('Select a project first', 'warning');
+      this._switchPanel('projects');
       return;
     }
 
-    const selStr = document.getElementById('modelSelect').value;
-    if (!selStr) {
-      this._toast('Select an AI model', 'warning');
+    const selEl = document.getElementById('modelSelect');
+    if (!selEl.value) { this._toast('Select a model first', 'warning'); return; }
+    const model = JSON.parse(selEl.value);
+
+    const apiKey = model.provider === 'groq' ? this.cfg.groqKey : this.cfg.openrouterKey;
+    if (!apiKey) {
+      this._toast(`Add your ${model.provider === 'groq' ? 'Groq' : 'OpenRouter'} API key in Settings`, 'error');
+      this._switchPanel('settings');
       return;
     }
-    const modelObj = JSON.parse(selStr);
 
-    input.value = '';
-    input.style.height = 'auto';
-
+    // Save + render user message
     const userMsg = {
       projectId: this.currentProjId,
       role:      'user',
@@ -1243,401 +1266,566 @@ class App {
     };
     if (this.cfg.autosave) userMsg.id = await this.db.put('messages', userMsg);
     this.messages.push(userMsg);
-    this._renderMessages();
 
-    this.isGenerating = true;
-    const sendBtn = document.getElementById('sendBtn');
-    sendBtn.disabled = true;
+    input.value       = '';
+    input.style.height = 'auto';
 
-    const snap = await this.ghWorkspace?.getSnapshot(this.currentProjId);
-    const repoInfo = snap ? { owner: snap.owner, repo: snap.repo, branch: snap.branch } : null;
+    // Build whole-project context — AI sees the full file tree + relevant files
+    const ctxText = await this.ctx.build(
+      this.currentProjId,
+      this.openFilePath,
+      this.currentRepo || null,
+      text
+    );
 
-    this._updateCtxIndicator('Building context…');
-    const ctxString = await this.ctx.build(this.currentProjId, this.openFilePath, repoInfo, text);
-    this._updateCtxIndicator(ctxString ? 'Context injected' : '');
+    // Show what's in context to the user
+    this._updateCtxIndicator(text);
 
-    const rolePrompt   = ROLES[this.activeRole] || ROLES[''];
-    const customPrompt = this.cfg.systemPrompt ? `\n\nUser System Instructions: ${this.cfg.systemPrompt}` : '';
-    const systemContent = rolePrompt + customPrompt + (ctxString ? `\n\n--- CURRENT PROJECT CONTEXT ---\n${ctxString}` : '');
+    const sysLines = [ROLES[this.activeRole] || ROLES['']];
+    // Critical instruction: always output full files with path header so Apply button works
+    sysLines.push(
+      '\nIMPORTANT: When writing or modifying any file, always output the COMPLETE file content ' +
+      '(never partial snippets) in a fenced code block whose FIRST LINE is a comment with the ' +
+      'file path, like this:\n' +
+      '```js\n// src/components/Button.jsx\n...full content...\n```\n' +
+      'Use the exact path from the project file tree. This allows changes to be applied directly.'
+    );
+    if (ctxText)               sysLines.push('\n--- Project Context ---\n' + ctxText);
+    if (this.cfg.systemPrompt) sysLines.push('\n' + this.cfg.systemPrompt);
 
-    const apiMsgs = [
-      { role: 'system', content: systemContent },
-      ...this.messages.slice(-MAX_HISTORY).map(m => ({ role: m.role, content: m.content }))
-    ];
+    const histSlice = this.messages.slice(-MAX_HISTORY).map(m => ({
+      role:    m.role,
+      content: m.content.length > MAX_FILE_CHARS
+        ? m.content.slice(0, MAX_FILE_CHARS / 2) + '\n…\n' + m.content.slice(-MAX_FILE_CHARS / 2)
+        : m.content
+    }));
 
-    const assistantMsg = {
-      projectId: this.currentProjId,
-      role:      'assistant',
-      content:   '',
-      timestamp: Date.now()
-    };
-    this.messages.push(assistantMsg);
+    const apiMsgs = [{ role: 'system', content: sysLines.join('\n') }, ...histSlice];
 
-    const wrap = document.getElementById('chatMessages');
-    const aiDiv = document.createElement('div');
-    aiDiv.className = 'message assistant';
-    aiDiv.innerHTML = `
+    // Render bubbles
+    const el = document.getElementById('chatMessages');
+    el.querySelector('.empty-state')?.remove();
+    const userEl = document.createElement('div');
+    userEl.innerHTML = this._msgHTML(userMsg);
+    el.appendChild(userEl.firstElementChild);
+
+    const aEl = document.createElement('div');
+    aEl.className = 'message assistant';
+    aEl.innerHTML = `
       <div class="msg-avatar">AI</div>
       <div class="msg-body">
-        <div class="msg-name">MiniCodi</div>
-        <div class="msg-bubble"><div class="loading-dots"><span></span><span></span><span></span></div></div>
-      </div>
-    `;
-    wrap.appendChild(aiDiv);
-    wrap.scrollTop = wrap.scrollHeight;
-    const bubble = aiDiv.querySelector('.msg-bubble');
+        <div class="msg-name">Assistant</div>
+        <div class="msg-bubble" id="streamBubble">
+          <div class="loading-dots"><span></span><span></span><span></span></div>
+        </div>
+      </div>`;
+    el.appendChild(aEl);
+    el.scrollTop = el.scrollHeight;
 
+    const bubble      = document.getElementById('streamBubble');
+    this.isGenerating = true;
+    document.getElementById('sendBtn').disabled = true;
+
+    let full = '';
     try {
-      let client;
-      if (modelObj.provider === 'groq') {
-        if (!this.cfg.groqKey) throw new Error('Groq API Key missing in Settings');
-        client = new GroqClient(this.cfg.groqKey);
-      } else {
-        if (!this.cfg.openrouterKey) throw new Error('OpenRouter API Key missing in Settings');
-        client = new OpenRouterClient(this.cfg.openrouterKey);
+      const client = model.provider === 'groq'
+        ? new GroqClient(apiKey)
+        : new OpenRouterClient(apiKey);
+
+      for await (const chunk of client.stream(apiMsgs, model.id, this.cfg.maxTokens)) {
+        full        += chunk;
+        bubble.innerHTML = renderMd(full);
+        el.scrollTop = el.scrollHeight;
       }
+      if (!full) full = '*(No response — check your API key and model)*';
+    } catch (err) {
+      full             = `**Error:** ${err.message}`;
+      bubble.innerHTML = renderMd(full);
+      this._toast(err.message, 'error');
+    }
 
-      let fullText = '';
-      for await (const chunk of client.stream(apiMsgs, modelObj.id, this.cfg.maxTokens)) {
-        fullText += chunk;
-        bubble.innerHTML = renderMd(fullText);
-        wrap.scrollTop = wrap.scrollHeight;
+    // Save assistant message
+    const aMsg = {
+      projectId: this.currentProjId,
+      role:      'assistant',
+      content:   full,
+      timestamp: Date.now()
+    };
+    if (this.cfg.autosave) aMsg.id = await this.db.put('messages', aMsg);
+    this.messages.push(aMsg);
+
+    // Inject Apply buttons for any file blocks in the response
+    await this._tryExtractFiles(full, bubble);
+
+    this.isGenerating = false;
+    document.getElementById('sendBtn').disabled = false;
+  }
+
+  // After AI responds: find all file code blocks and inject Apply buttons
+  async _tryExtractFiles(content, bubbleEl) {
+    // Pattern: ```lang\n// path/to/file.ext\n...code...```
+    const rx = /```(\w*)\n\/\/ ?([\w\-./]+\.\w+)\n([\s\S]*?)```/g;
+    let m;
+    let found = false;
+    while ((m = rx.exec(content)) !== null) {
+      const [, , path] = m;
+      found = true;
+
+      // Find the rendered <pre> blocks in the bubble and inject Apply button after each
+      // We tag them by data attribute so we can match them
+      if (bubbleEl) {
+        const pres = bubbleEl.querySelectorAll('pre');
+        for (const pre of pres) {
+          const codeText = pre.textContent || '';
+          // Match this pre to the extracted path via first-line comment
+          const firstLine = codeText.split('\n')[0].trim();
+          if (firstLine === `// ${path}` || firstLine === `// ${path.replace(/^\//, '')}`) {
+            if (!pre.nextSibling?.classList?.contains('apply-btn-wrap')) {
+              const wrap = document.createElement('div');
+              wrap.className = 'apply-btn-wrap';
+              wrap.innerHTML = `
+                <button class="apply-btn" data-path="${esc(path)}">
+                  ✓ Apply to <code>${esc(path)}</code>
+                </button>`;
+              wrap.querySelector('.apply-btn').addEventListener('click', () =>
+                this._applyFileFromChat(path, codeText.replace(/^\/\/ [\w\-./]+\n/, '').trimEnd(), wrap)
+              );
+              pre.parentNode.insertBefore(wrap, pre.nextSibling);
+            }
+          }
+        }
       }
+    }
+    return found;
+  }
 
-      assistantMsg.content = fullText;
-      if (this.cfg.autosave) assistantMsg.id = await this.db.put('messages', assistantMsg);
-      this._injectApplyButtons();
-
-    } catch (e) {
-      bubble.innerHTML = `<span style="color:var(--danger)">Error: ${esc(e.message)}</span>`;
-      assistantMsg.content = `Error: ${e.message}`;
-    } finally {
-      this.isGenerating = false;
-      sendBtn.disabled  = false;
-      this._updateCtxIndicator('');
+  async _applyFileFromChat(path, code, wrapEl) {
+    if (!this.currentProjId) { this._toast('No project open', 'error'); return; }
+    await this.workspace.writeFile(this.currentProjId, path, code);
+    this._toast(`Applied → ${path}`, 'success');
+    // Update button to show applied state
+    if (wrapEl) {
+      wrapEl.innerHTML = `<span class="apply-btn applied">✓ Applied to <code>${esc(path)}</code></span>`;
     }
   }
 
-  _updateCtxIndicator(text) {
-    const el = document.getElementById('ctxIndicator');
-    if (el) el.textContent = text;
+  // Export workspace as ZIP (for projects not linked to GitHub)
+  async _exportZip() {
+    if (!this.currentProjId) { this._toast('No project open', 'error'); return; }
+    this._toast('Building ZIP…');
+    try {
+      if (!window.JSZip) {
+        await new Promise((res, rej) => {
+          const s  = document.createElement('script');
+          s.src    = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
+          s.onload = res; s.onerror = rej;
+          document.head.appendChild(s);
+        });
+      }
+      const zip   = new JSZip();
+      const files = await this.workspace.listFiles(this.currentProjId);
+      const alive = files.filter(f => f.status !== 'deleted');
+      for (const f of alive) {
+        zip.file(f.path, f.content || '');
+      }
+      const blob     = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+      const projName = this.currentProj?.name || 'project';
+      const url      = URL.createObjectURL(blob);
+      Object.assign(document.createElement('a'), {
+        href:     url,
+        download: `${projName}-${Date.now()}.zip`
+      }).click();
+      URL.revokeObjectURL(url);
+      this._toast(`Exported ${alive.length} files as ZIP`, 'success');
+    } catch (e) {
+      this._toast(`ZIP export failed: ${e.message}`, 'error');
+    }
   }
 
+  // ── GitHub ────────────────────────────────────
   _setupGit() {
-    document.getElementById('btnConnectGit').addEventListener('click', async () => {
-      const token = document.getElementById('githubTokenInput').value.trim();
-      if (!token) { this._toast('Token required', 'error'); return; }
-      await this.db.put('settings', { key: 'githubToken', value: token });
-      this.cfg.githubToken = token;
-      this.gh          = new GitHub(token);
-      this.ghWorkspace = new GitWorkspace(this.db, this.workspace, this.gh);
-      await this._connectGit();
-    });
-
-    document.getElementById('btnDisconnectGit').addEventListener('click', async () => {
-      await this.db.del('settings', 'githubToken');
-      this.cfg.githubToken = null;
-      this.gh              = null;
-      this.ghWorkspace     = null;
-      this.ghUser          = null;
-      this.repos           = [];
-      this.currentRepo     = null;
-      document.getElementById('gitNotConnected').classList.remove('hidden');
-      document.getElementById('gitConnected').classList.add('hidden');
-      this._toast('Disconnected from GitHub');
-    });
-
-    document.getElementById('btnPull').addEventListener('click', () => this._doPull());
-    document.getElementById('btnCommit').addEventListener('click', () => openSheet('sheetCommit'));
-    document.getElementById('btnPush').addEventListener('click', () => openSheet('sheetCommit'));
-    document.getElementById('btnDoCommit').addEventListener('click', () => this._doPush());
-
-    document.getElementById('zipUpload').addEventListener('change', e => this._handleZipUpload(e));
-  }
-
-  async _tryAutoConnectGit() {
-    if (!this.cfg.githubToken) return;
-    try {
-      await this._connectGit();
-    } catch (e) {
-      console.warn('Auto GitHub connect failed:', e.message);
-    }
+    document.getElementById('btnConnectGit').addEventListener('click',    () => this._connectGit());
+    document.getElementById('btnDisconnectGit').addEventListener('click', () => this._disconnectGit());
+    document.getElementById('btnPull').addEventListener('click',          () => this._pull());
+    document.getElementById('btnPush').addEventListener('click',          () => openSheet('sheetCommit'));
+    document.getElementById('btnCommit').addEventListener('click',        () => openSheet('sheetCommit'));
+    document.getElementById('btnDoCommit').addEventListener('click',      () => this._push());
+    document.getElementById('zipUpload').addEventListener('change',       e  => this._loadZip(e.target.files[0]));
   }
 
   async _connectGit() {
+    const token = document.getElementById('githubTokenInput').value.trim()
+      || document.getElementById('githubTokenSettings').value.trim()
+      || this.cfg.githubToken;
+    if (!token) { this._toast('Enter a GitHub token', 'error'); return; }
+
     try {
-      this.ghUser = await this.gh.getUser();
-      document.getElementById('gitNotConnected').classList.add('hidden');
-      document.getElementById('gitConnected').classList.remove('hidden');
-      document.getElementById('gitUserName').textContent  = this.ghUser.name || this.ghUser.login;
-      document.getElementById('gitUserLogin').textContent = `@${this.ghUser.login}`;
-      await this._loadRepos();
+      this.gh          = new GitHub(token);
+      this.ghWorkspace = new GitWorkspace(this.db, this.workspace, this.gh);
+      this.ghUser      = await this.gh.getUser();
+      this.repos       = await this.gh.getRepos();
+      await this.db.put('settings', { key: 'githubToken', value: token });
+      this.cfg.githubToken = token;
+      document.getElementById('githubTokenSettings').value = token;
+      this._showGitConnected();
+      this._toast(`Connected as ${this.ghUser.login}`, 'success');
     } catch (e) {
-      this._toast(`GitHub connection failed: ${e.message}`, 'error');
+      this._toast(`GitHub: ${e.message}`, 'error');
     }
   }
 
-  async _loadRepos() {
-    this.repos = await this.gh.getRepos();
-    const list = document.getElementById('repoList');
-    list.innerHTML = this.repos.map(r => `
+  async _tryAutoConnectGit() {
+    try {
+      this.ghUser  = await this.gh.getUser();
+      this.repos   = await this.gh.getRepos();
+      this.ghWorkspace = new GitWorkspace(this.db, this.workspace, this.gh);
+      this._showGitConnected();
+    } catch {}
+  }
+
+  _showGitConnected() {
+    document.getElementById('gitNotConnected').classList.add('hidden');
+    document.getElementById('gitConnected').classList.remove('hidden');
+    document.getElementById('gitUserName').textContent  = this.ghUser.name || this.ghUser.login;
+    document.getElementById('gitUserLogin').textContent = `@${this.ghUser.login}`;
+    this._renderRepoList();
+  }
+
+  _disconnectGit() {
+    this.gh = null; this.ghUser = null; this.repos = []; this.currentRepo = null;
+    this.cfg.githubToken = '';
+    this.db.put('settings', { key: 'githubToken', value: '' });
+    document.getElementById('gitNotConnected').classList.remove('hidden');
+    document.getElementById('gitConnected').classList.add('hidden');
+    document.getElementById('githubTokenInput').value    = '';
+    document.getElementById('githubTokenSettings').value = '';
+    this._toast('Disconnected from GitHub');
+  }
+
+  _renderRepoList() {
+    const el = document.getElementById('repoList');
+    el.innerHTML = this.repos.map(r => `
       <div class="repo-card ${this.currentRepo?.repo === r.name ? 'selected' : ''}"
-           onclick="app._selectRepo('${r.owner.login}', '${r.name}', '${r.default_branch}')">
+           onclick="app._selectRepo('${esc(r.owner.login)}','${esc(r.name)}','${r.default_branch}')">
         <div class="repo-name">${esc(r.full_name)}</div>
-        <div class="repo-meta">${r.private ? '🔒 Private' : '🌐 Public'} · ${r.default_branch} · ${this._ago(new Date(r.updated_at).getTime())}</div>
+        <div class="repo-meta">${r.private ? '🔒 Private' : '🌐 Public'} · ${r.default_branch}</div>
       </div>
     `).join('');
   }
 
   async _selectRepo(owner, repo, branch) {
     this.currentRepo = { owner, repo, branch };
+    this._renderRepoList();
     document.getElementById('repoDetail').classList.remove('hidden');
-    document.getElementById('repoDetailName').textContent = `${owner}/${repo} (${branch})`;
-    this._loadRepos();
-
-    if (!this.currentProjId) {
-      const p = {
-        name:      repo,
-        desc:      `Imported from GitHub ${owner}/${repo}`,
-        stack:     'other',
-        createdAt: Date.now(),
-        updatedAt: Date.now()
-      };
-      const id = await this.db.put('projects', p);
-      await this._loadProjects();
-      this.currentProjId = id;
-      this.currentProj   = p;
-    }
+    document.getElementById('repoDetailName').textContent = `${owner}/${repo}`;
+    document.getElementById('fileTree').innerHTML = '<div class="text-tertiary text-sm">Loading…</div>';
+    document.getElementById('commitList').innerHTML = '';
 
     try {
-      const commits = await this.gh.getCommits(owner, repo, branch);
-      document.getElementById('commitList').innerHTML = commits.map(c => `
-        <div style="font-size:12px;padding:6px 0;border-bottom:1px solid var(--border);">
-          <div class="font-mono text-accent">${c.sha.slice(0, 7)} — ${esc(c.commit.message.split('\n')[0])}</div>
-          <div class="text-tertiary">${c.commit.author.name} · ${this._ago(new Date(c.commit.author.date).getTime())}</div>
+      const [commits, branches] = await Promise.all([
+        this.gh.getCommits(owner, repo, branch),
+        this.gh.getBranches(owner, repo)
+      ]);
+
+      // Branch picker
+      document.getElementById('repoDetailName').textContent =
+        `${owner}/${repo} · ${branches.length} branch${branches.length>1?'es':''} · ${commits.length} commits`;
+
+      // Show top-level files (lazy)
+      const contents = await this.gh.getContents(owner, repo);
+      const treeEl   = document.getElementById('fileTree');
+      treeEl.innerHTML = contents.map(item => `
+        <div class="file-item" onclick="app._browseGitItem('${esc(item.path)}','${item.type}')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+               style="color:${item.type==='dir'?'var(--accent)':'var(--text-tertiary)'}">
+            ${item.type === 'dir'
+              ? '<path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/>'
+              : '<path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/>'}
+          </svg>
+          <span class="truncate">${esc(item.name)}</span>
         </div>
       `).join('');
+
+      document.getElementById('commitList').innerHTML = commits.slice(0, 6).map(c => `
+        <div style="padding:8px 0;border-bottom:1px solid var(--border);font-size:13px;">
+          <div style="font-weight:500">${esc(c.commit.message.split('\n')[0])}</div>
+          <div class="text-tertiary" style="font-size:11px;margin-top:2px">
+            ${esc(c.commit.author.name)} · ${this._ago(new Date(c.commit.author.date))}
+          </div>
+        </div>
+      `).join('');
+
+      // Check if project is linked — offer to pull
+      if (this.currentProjId) {
+        const snap = await this.ghWorkspace?.getSnapshot(this.currentProjId);
+        if (!snap) {
+          this._toast(`Tip: tap Pull to download ${owner}/${repo} into your project`, 'info');
+        }
+      }
     } catch (e) {
-      console.warn('Commits load failed:', e.message);
+      this._toast(e.message, 'error');
+      document.getElementById('fileTree').innerHTML =
+        `<div class="text-danger text-sm">${esc(e.message)}</div>`;
     }
   }
 
-  async _doPull() {
-    if (!this.currentProjId || !this.currentRepo) {
-      this._toast('Select a project and GitHub repository first', 'warning');
+  async _browseGitItem(path, type) {
+    if (!this.currentRepo) return;
+    const { owner, repo } = this.currentRepo;
+    if (type === 'dir') {
+      // Show directory contents inline
+      try {
+        const contents = await this.gh.getContents(owner, repo, path);
+        document.getElementById('fileTree').innerHTML =
+          `<div class="file-item" onclick="app._selectRepo('${esc(owner)}','${esc(repo)}','${this.currentRepo.branch}')">
+             <span style="color:var(--text-tertiary)">← back</span>
+           </div>` +
+          contents.map(item => `
+            <div class="file-item" onclick="app._browseGitItem('${esc(item.path)}','${item.type}')">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                   style="color:${item.type==='dir'?'var(--accent)':'var(--text-tertiary)'}">
+                ${item.type === 'dir'
+                  ? '<path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/>'
+                  : '<path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/>'}
+              </svg>
+              <span class="truncate">${esc(item.name)}</span>
+            </div>
+          `).join('');
+      } catch (e) { this._toast(e.message, 'error'); }
       return;
     }
+    // File — read into chat
+    try {
+      const { content } = await this.gh.getFileMeta(owner, repo, path, this.currentRepo.branch);
+      const truncated   = content.length > MAX_FILE_CHARS;
+      const clipped     = truncated ? content.slice(0, MAX_FILE_CHARS) + '\n…[truncated]…' : content;
+      const ext         = path.split('.').pop();
+      const msg = {
+        projectId: this.currentProjId || 0,
+        role:      'user',
+        content:   `GitHub file: \`${path}\`\n\`\`\`${ext}\n${clipped}\n\`\`\`\n\nPlease review this file for production readiness.`,
+        timestamp: Date.now()
+      };
+      if (this.currentProjId && this.cfg.autosave) msg.id = await this.db.put('messages', msg);
+      this.messages.push(msg);
+      this._switchPanel('chat');
+      this._renderMessages();
+      if (truncated) this._toast(`File truncated to ${MAX_FILE_CHARS} chars`, 'warning');
+    } catch (e) { this._toast(e.message, 'error'); }
+  }
+
+  // ── Pull ──────────────────────────────────────
+  async _pull() {
+    if (!this.currentRepo) { this._toast('Select a repository first', 'error'); return; }
+    if (!this.currentProjId) { this._toast('Select a project first — it will hold the pulled files', 'warning'); return; }
+    if (!this.ghWorkspace)   { this._toast('Not connected to GitHub', 'error'); return; }
+
     const { owner, repo, branch } = this.currentRepo;
-    const btn = document.getElementById('btnPull');
-    btn.disabled = true;
+    const changes = await this.workspace.getChanges(this.currentProjId);
+    if (changes.length && !confirm(`You have ${changes.length} local change(s). Pull will overwrite modified clean files. Continue?`)) return;
+
+    // Progress shown via toasts
+    let lastToast = null;
+    const onProgress = msg => {
+      if (lastToast) lastToast.remove?.();
+      this._toast(msg);
+    };
 
     try {
-      const res = await this.ghWorkspace.pull(this.currentProjId, owner, repo, branch, msg => {
-        this._toast(msg, 'warning');
+      const { commitSha, fileCount } = await this.ghWorkspace.pull(
+        this.currentProjId, owner, repo, branch, onProgress
+      );
+      // Link project to repo
+      await this.db.put('projects', {
+        ...this.currentProj,
+        githubOwner:  owner,
+        githubRepo:   repo,
+        githubBranch: branch,
+        updatedAt:    Date.now()
       });
-      this._toast(`Pulled ${res.fileCount} files (${res.commitSha.slice(0,7)})`, 'success');
-      this._renderFileBrowser();
+      this.currentProj = await this.db.get('projects', this.currentProjId);
+      this._toast(`✓ Pulled ${fileCount} files @ ${commitSha.slice(0,7)}`, 'success');
     } catch (e) {
       this._toast(`Pull failed: ${e.message}`, 'error');
-    } finally {
-      btn.disabled = false;
     }
   }
 
-  async _doPush() {
-    if (!this.currentProjId || !this.currentRepo) {
-      this._toast('Select a project and GitHub repository first', 'warning');
-      return;
-    }
+  // ── Push ──────────────────────────────────────
+  async _push() {
     const msg = document.getElementById('commitMsg').value.trim();
-    if (!msg) { this._toast('Commit message required', 'error'); return; }
+    if (!msg) { this._toast('Enter a commit message', 'error'); return; }
 
-    const { owner, repo, branch } = this.currentRepo;
-    const btn = document.getElementById('btnDoCommit');
-    btn.disabled = true;
+    const repo = this.currentRepo || (this.currentProj
+      ? { owner: this.currentProj.githubOwner, repo: this.currentProj.githubRepo, branch: this.currentProj.githubBranch }
+      : null);
 
+    if (!repo?.owner) { this._toast('No repository linked. Pull a repo first.', 'error'); return; }
+    if (!this.ghWorkspace) { this._toast('Not connected to GitHub', 'error'); return; }
+
+    closeSheet('sheetCommit');
+
+    const onProgress = m => this._toast(m);
     try {
-      const res = await this.ghWorkspace.push(this.currentProjId, owner, repo, branch, msg, status => {
-        this._toast(status, 'warning');
-      });
-      closeSheet('sheetCommit');
-      closeSheet('sheetChanges');
+      const { commitSha, filesChanged } = await this.ghWorkspace.push(
+        this.currentProjId, repo.owner, repo.repo, repo.branch, msg, onProgress
+      );
       document.getElementById('commitMsg').value = '';
-      this._toast(`Pushed commit ${res.commitSha.slice(0,7)}`, 'success');
-      this._renderFileBrowser();
+      this._toast(`✓ Pushed ${filesChanged} file(s) — ${commitSha.slice(0,7)}`, 'success');
+      // Refresh commit list if git panel is open
+      this._selectRepo(repo.owner, repo.repo, repo.branch);
     } catch (e) {
       this._toast(`Push failed: ${e.message}`, 'error');
-    } finally {
-      btn.disabled = false;
     }
-  }
-
-  async _handleZipUpload(e) {
-    const file = e.target.files[0];
-    if (!file) return;
-
-    if (typeof JSZip === 'undefined') {
-      this._toast('JSZip library not loaded. Ensure JSZip script is included.', 'error');
-      return;
-    }
-
-    try {
-      const zip = await JSZip.loadAsync(file);
-      const projName = file.name.replace(/\.zip$/i, '');
-
-      const p = {
-        name:      projName,
-        desc:      'Imported from ZIP archive',
-        stack:     'other',
-        createdAt: Date.now(),
-        updatedAt: Date.now()
-      };
-      const projId = await this.db.put('projects', p);
-      await this._loadProjects();
-      this._selectProject(projId);
-
-      let count = 0;
-      for (const [path, zipEntry] of Object.entries(zip.files)) {
-        if (zipEntry.dir || SKIP_EXTS.test(path)) continue;
-        const content = await zipEntry.async('string');
-        await this.workspace.writeFile(projId, path, content, { status: 'clean', baseContent: content });
-        count++;
-      }
-
-      this._toast(`Imported ZIP with ${count} files`, 'success');
-      this._renderFileBrowser();
-
-    } catch (err) {
-      this._toast(`Failed to load ZIP: ${err.message}`, 'error');
-    }
-  }
-
-  async _exportZip() {
-    if (!this.currentProjId) return;
-    if (typeof JSZip === 'undefined') {
-      this._toast('JSZip library required to export ZIP', 'error');
-      return;
-    }
-
-    const files = await this.workspace.listFiles(this.currentProjId);
-    const zip   = new JSZip();
-
-    for (const f of files) {
-      if (f.status !== 'deleted' && f.content != null) {
-        zip.file(f.path, f.content);
-      }
-    }
-
-    const blob = await zip.generateAsync({ type: 'blob' });
-    const a    = document.createElement('a');
-    a.href     = URL.createObjectURL(blob);
-    a.download = `${this.currentProj.name || 'project'}.zip`;
-    a.click();
-    URL.revokeObjectURL(a.href);
-    this._toast('Exported ZIP archive', 'success');
   }
 
   _refreshGitUI() {
-    if (this.cfg.githubToken && !this.ghUser) {
-      this._connectGit();
+    if (this.ghUser) this._showGitConnected();
+  }
+
+  // ── ZIP ───────────────────────────────────────
+  async _loadZip(file) {
+    if (!file) return;
+    this._toast('Reading ZIP…');
+    try {
+      if (!window.JSZip) {
+        await new Promise((res, rej) => {
+          const s    = document.createElement('script');
+          s.src      = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
+          s.onload   = res; s.onerror = rej;
+          document.head.appendChild(s);
+        });
+      }
+      const zip  = await JSZip.loadAsync(file);
+      const proj = {
+        name:      file.name.replace('.zip', ''),
+        desc:      'Loaded from ZIP',
+        stack:     'other',
+        createdAt: Date.now(),
+        updatedAt: Date.now()
+      };
+      const projId = await this.db.put('projects', proj);
+      let count    = 0;
+      for (const [path, entry] of Object.entries(zip.files)) {
+        if (entry.dir) continue;
+        if (path.startsWith('__MACOSX') || path.endsWith('.DS_Store')) continue;
+        try {
+          const content = await entry.async('string');
+          await this.workspace.writeFile(projId, path, content, { status: 'new' });
+          count++;
+        } catch {}
+      }
+      await this._loadProjects();
+      this._renderProjects();
+      this._toast(`ZIP loaded: ${count} files`, 'success');
+      this._selectProject(projId);
+    } catch (e) {
+      this._toast(`ZIP error: ${e.message}`, 'error');
     }
   }
 
+  // ── Settings ──────────────────────────────────
   _setupSettings() {
-    document.getElementById('btnSaveSettings').addEventListener('click', () => this._saveSettings());
-    document.getElementById('btnExport').addEventListener('click', () => this._exportData());
-    document.getElementById('btnImport').addEventListener('click', () => document.getElementById('importFile').click());
-    document.getElementById('importFile').addEventListener('change', e => this._importData(e));
-    document.getElementById('btnClearAll').addEventListener('click', () => this._clearAllData());
+    document.getElementById('btnSaveSettings').addEventListener('click',  () => this._saveSettings());
+    document.getElementById('btnExport').addEventListener('click',        () => this._exportData());
+    document.getElementById('btnImport').addEventListener('click',        () =>
+      document.getElementById('importFile').click());
+    document.getElementById('importFile').addEventListener('change',      e  => this._importData(e.target.files[0]));
+    document.getElementById('btnClearAll').addEventListener('click',      () => this._clearAll());
   }
 
   async _exportData() {
     const data = {
-      projects:  await this.db.getAll('projects'),
-      messages:  await this.db.getAll('messages'),
-      settings:  await this.db.getAll('settings'),
-      files:     await this.db.getAll('files'),
-      snapshots: await this.db.getAll('gitSnapshots'),
+      projects:     await this.db.getAll('projects'),
+      messages:     await this.db.getAll('messages'),
+      files:        await this.db.getAll('files'),
+      gitSnapshots: await this.db.getAll('gitSnapshots'),
+      exportedAt:   new Date().toISOString()
     };
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-    const a    = document.createElement('a');
-    a.href     = URL.createObjectURL(blob);
-    a.download = `minicodi-backup-${new Date().toISOString().slice(0, 10)}.json`;
-    a.click();
-    URL.revokeObjectURL(a.href);
-    this._toast('Exported configuration & project data', 'success');
+    const url  = URL.createObjectURL(blob);
+    Object.assign(document.createElement('a'), { href: url, download: `minicodi-${Date.now()}.json` }).click();
+    URL.revokeObjectURL(url);
+    this._toast('Data exported', 'success');
   }
 
-  async _importData(e) {
-    const file = e.target.files[0];
+  async _importData(file) {
     if (!file) return;
     try {
-      const text = await file.text();
-      const data = JSON.parse(text);
-
-      if (data.projects)  for (const p of data.projects)  await this.db.put('projects', p);
-      if (data.messages)  for (const m of data.messages)  await this.db.put('messages', m);
-      if (data.settings)  for (const s of data.settings)  await this.db.put('settings', s);
-      if (data.files)     for (const f of data.files)     await this.db.put('files', f);
-      if (data.snapshots) for (const s of data.snapshots) await this.db.put('gitSnapshots', s);
-
-      await this._loadSettings();
+      const data = JSON.parse(await file.text());
+      if (data.projects)     for (const p of data.projects)     await this.db.put('projects',     p);
+      if (data.messages)     for (const m of data.messages)     await this.db.put('messages',     m);
+      if (data.files)        for (const f of data.files)        await this.db.put('files',        f);
+      if (data.gitSnapshots) for (const s of data.gitSnapshots) await this.db.put('gitSnapshots', s);
       await this._loadProjects();
-      this._applySettings();
       this._renderProjects();
-      this._toast('Import successful', 'success');
-    } catch (err) {
-      this._toast(`Import failed: ${err.message}`, 'error');
+      this._toast('Data imported', 'success');
+    } catch (e) {
+      this._toast('Import failed: ' + e.message, 'error');
     }
+    document.getElementById('importFile').value = '';
   }
 
-  async _clearAllData() {
-    if (!confirm('Clear all projects, settings, and workspace data? This cannot be undone.')) return;
-    await this.db.clear('projects');
-    await this.db.clear('messages');
-    await this.db.clear('settings');
-    await this.db.clear('files');
-    await this.db.clear('gitSnapshots');
-
-    this.cfg           = {};
-    this.projects      = [];
-    this.currentProjId = null;
-    this.currentProj   = null;
-    this.messages      = [];
-    this.openFilePath  = null;
-
-    this._applySettings();
+  async _clearAll() {
+    if (!confirm('Delete ALL data permanently?')) return;
+    for (const s of ['projects','messages','files','settings','gitSnapshots']) await this.db.clear(s);
+    this.projects = []; this.messages = []; this.currentProjId = null; this.currentProj = null; this.cfg = {};
     this._renderProjects();
-    this._renderMessages();
-    this._renderFileBrowser();
     this._toast('All data cleared');
   }
 
-  _toast(msg, type = 'info') {
-    const wrap  = document.getElementById('toasts');
-    if (!wrap) return;
-    const t     = document.createElement('div');
-    t.className = `toast ${type}`;
-    t.textContent = msg;
-    wrap.appendChild(t);
-    setTimeout(() => {
-      t.style.opacity = '0';
-      t.style.transform = 'translateY(-10px)';
-      setTimeout(() => t.remove(), 250);
-    }, 3000);
+  // ── Context indicator ─────────────────────────
+  async _updateCtxIndicator(userText) {
+    const el = document.getElementById('ctxIndicator');
+    if (!el || !this.currentProjId) return;
+    const allFiles    = await this.workspace.listFiles(this.currentProjId);
+    const textFiles   = allFiles.filter(f => TEXT_EXTS.test(f.path) && !SKIP_EXTS.test(f.path));
+    const changes     = await this.workspace.getChanges(this.currentProjId);
+    const changedPaths = new Set(changes.map(f => f.path));
+
+    // Re-score to show which files will be included
+    const scored = textFiles
+      .map(f => ({ f, score: this.ctx._score(f, userText, this.openFilePath, changedPaths) }))
+      .filter(({ score }) => score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, MAX_CTX_FILES + 2);
+
+    if (!textFiles.length) {
+      el.textContent = '';
+      return;
+    }
+    const names = scored.slice(0, 4).map(({ f }) => f.path.split('/').pop()).join(', ');
+    const more  = scored.length > 4 ? ` +${scored.length - 4}` : '';
+    el.innerHTML = `<strong>AI sees:</strong> ${textFiles.length} file tree · ${scored.length} files in context (${names}${more})`;
   }
 
-  _ago(ms) {
-    const sec = Math.floor((Date.now() - ms) / 1000);
-    if (sec < 60)   return 'just now';
-    if (sec < 3600) return `${Math.floor(sec / 60)}m ago`;
-    if (sec < 86400) return `${Math.floor(sec / 3600)}h ago`;
-    return `${Math.floor(sec / 86400)}d ago`;
+  // ── Toast ─────────────────────────────────────
+  _toast(msg, type = 'info') {
+    const wrap = document.getElementById('toasts');
+    const t    = document.createElement('div');
+    t.className = `toast ${type}`;
+    const icon  = type==='success' ? '✓' : type==='error' ? '✗' : type==='warning' ? '⚠' : 'ℹ';
+    t.innerHTML = `<span>${icon}</span><span>${esc(msg)}</span>`;
+    wrap.appendChild(t);
+    setTimeout(() => {
+      t.style.opacity   = '0';
+      t.style.transform = 'translateY(-8px)';
+      setTimeout(() => t.remove(), 280);
+    }, 3500);
+    return t;
+  }
+
+  // ── Helpers ───────────────────────────────────
+  _ago(ts) {
+    const s = Math.floor((Date.now() - new Date(ts).getTime()) / 1000);
+    if (s < 60) return 'just now';
+    const m = Math.floor(s / 60); if (m < 60) return `${m}m ago`;
+    const h = Math.floor(m / 60); if (h < 24) return `${h}h ago`;
+    return `${Math.floor(h / 24)}d ago`;
   }
 }
 
-// Instantiate and attach global instance
+// ════════════════════════════════════════════════
+// Boot
+// ════════════════════════════════════════════════
 const app = new App();
-window.app = app;
-document.addEventListener('DOMContentLoaded', () => app.init());
-
+app.init();
