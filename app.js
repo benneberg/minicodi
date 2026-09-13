@@ -1,4 +1,3 @@
-Here is the completed app.js file, updated to reference service scripts loaded from the services/ directory.
 /* app.js — MiniCodi v2 */
 'use strict';
 
